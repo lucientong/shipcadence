@@ -83,13 +83,63 @@ def evaluate_thresholds(
 
 
 @node(name="check_thresholds")
-def check_thresholds(metrics: DORAMetrics) -> AlertResult:
-    """Evaluate DORA metrics against default alert thresholds.
+def check_thresholds(metrics: DORAMetrics) -> dict[str, Any]:
+    """Evaluate DORA metrics and route to the appropriate severity branch.
 
-    Receives ``DORAMetrics`` from ``compute_metrics`` and returns an
-    ``AlertResult`` indicating which thresholds were breached.
+    Returns a dict with a ``"branch"`` key that Dagloom uses to select
+    which downstream branch node to execute:
+
+    * ``"critical"`` — 3+ thresholds breached
+    * ``"warning"``  — 1–2 thresholds breached
+    * ``"ok"``       — all metrics healthy
+
+    The ``"data"`` key carries the ``AlertResult`` for downstream nodes.
     """
-    return evaluate_thresholds(metrics)
+    result = evaluate_thresholds(metrics)
+    n_alerts = len(result.alerts)
+    if n_alerts >= 3:
+        severity = "critical"
+    elif n_alerts >= 1:
+        severity = "warning"
+    else:
+        severity = "ok"
+    return {"branch": severity, "data": result}
+
+
+@node(name="critical")
+def handle_critical(payload: dict[str, Any]) -> dict[str, Any]:
+    """Handle critical alert — 3+ DORA thresholds breached."""
+    result: AlertResult = payload["data"]
+    return {
+        "severity": "critical",
+        "alerts": result.alerts,
+        "metrics": result.metrics,
+        "message": f"CRITICAL: {len(result.alerts)} DORA thresholds breached",
+    }
+
+
+@node(name="warning")
+def handle_warning(payload: dict[str, Any]) -> dict[str, Any]:
+    """Handle warning alert — 1–2 DORA thresholds breached."""
+    result: AlertResult = payload["data"]
+    return {
+        "severity": "warning",
+        "alerts": result.alerts,
+        "metrics": result.metrics,
+        "message": f"WARNING: {len(result.alerts)} DORA threshold(s) breached",
+    }
+
+
+@node(name="ok")
+def handle_ok(payload: dict[str, Any]) -> dict[str, Any]:
+    """Handle healthy state — all metrics within thresholds."""
+    result: AlertResult = payload["data"]
+    return {
+        "severity": "ok",
+        "alerts": (),
+        "metrics": result.metrics,
+        "message": "All DORA metrics within thresholds",
+    }
 
 
 # ---------------------------------------------------------------------------

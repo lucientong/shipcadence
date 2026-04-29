@@ -1,6 +1,6 @@
 """Pipeline assembly for ShipCadence DORA metrics.
 
-Uses Dagloom's ``parallel()`` helper (v1.0.1) to express the fan-out /
+Uses Dagloom's ``parallel()`` helper (v1.0.1+) to express the fan-out /
 fan-in topology declaratively::
 
     parallel(fetch_pulls, fetch_deployments, fetch_issues, pass_config)
@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from dagloom import parallel
+from dagloom import AsyncExecutor, parallel
 
 from shipcadence.nodes.alerts import format_report
 from shipcadence.nodes.github import fetch_deployments, fetch_issues, fetch_pulls
@@ -60,7 +60,14 @@ async def arun_analysis(
     repo: str,
     token: str,
     days: int = 90,
+    metrics_db: Any | None = None,
 ) -> dict[str, Any]:
-    """Execute the DORA pipeline asynchronously (concurrent fetches)."""
+    """Execute the DORA pipeline asynchronously (concurrent fetches).
+
+    When *metrics_db* is provided (a ``dagloom.store.db.Database``),
+    per-node execution timing and outcomes are recorded for
+    observability.
+    """
     pipeline = build_pipeline()
-    return await pipeline.arun(owner=owner, repo=repo, token=token, days=days)  # type: ignore[return-value]
+    executor = AsyncExecutor(pipeline, metrics_db=metrics_db)
+    return await executor.execute(owner=owner, repo=repo, token=token, days=days)  # type: ignore[return-value]

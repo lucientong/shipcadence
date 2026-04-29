@@ -4,6 +4,9 @@ Each node is an async function decorated with ``@node`` so Dagloom can
 orchestrate retries, caching, and timeout.  All three share the same
 parameter signature (``owner``, ``repo``, ``token``, ``days``) so they
 work as independent root nodes in a fan-out pipeline.
+
+Uses Dagloom's ``HTTPConnector`` with built-in ``paginate()``
+(v1.0.3, ``link_header`` strategy) for automatic GitHub pagination.
 """
 
 from __future__ import annotations
@@ -11,8 +14,9 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import httpx
 from dagloom import node
+from dagloom.connectors.base import ConnectionConfig
+from dagloom.connectors.http import HTTPConnector
 
 GITHUB_API = "https://api.github.com"
 
@@ -27,12 +31,20 @@ _DEFAULT_INCIDENT_LABELS = frozenset(
 )
 
 
-def _github_headers(token: str) -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
+def _github_config(token: str) -> ConnectionConfig:
+    """Build a ``ConnectionConfig`` for the GitHub API."""
+    return ConnectionConfig(
+        host="api.github.com",
+        timeout=25.0,
+        extra={
+            "base_url": GITHUB_API,
+            "headers": {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        },
+    )
 
 
 def _since_iso(days: int) -> str:
@@ -49,44 +61,29 @@ def _since_iso(days: int) -> str:
 async def fetch_pulls(owner: str, repo: str, token: str, days: int = 90) -> list[dict[str, Any]]:
     """Fetch merged pull requests within the analysis window.
 
-    Uses the ``/repos/{owner}/{repo}/pulls`` endpoint with ``state=closed``
-    and filters for PRs that have a non-null ``merged_at`` within *days*.
-    Paginates automatically (100 per page).
+    Uses ``HTTPConnector.paginate()`` with ``link_header`` strategy
+    for automatic GitHub-style pagination.
     """
     since = _since_iso(days)
     pulls: list[dict[str, Any]] = []
 
-    async with httpx.AsyncClient(
-        base_url=GITHUB_API,
-        headers=_github_headers(token),
-        timeout=25.0,
-    ) as client:
-        page = 1
-        while True:
-            resp = await client.get(
-                f"/repos/{owner}/{repo}/pulls",
-                params={
-                    "state": "closed",
-                    "sort": "updated",
-                    "direction": "desc",
-                    "per_page": 100,
-                    "page": page,
-                },
-            )
-            resp.raise_for_status()
-            batch: list[dict[str, Any]] = resp.json()
-            if not batch:
-                break
-
+    async with HTTPConnector(_github_config(token)) as http:
+        async for batch in http.paginate(
+            "GET",
+            path=f"/repos/{owner}/{repo}/pulls",
+            strategy="link_header",
+            params={
+                "state": "closed",
+                "sort": "updated",
+                "direction": "desc",
+            },
+        ):
             for pr in batch:
                 merged_at = pr.get("merged_at")
                 if merged_at and merged_at >= since:
                     pulls.append(pr)
                 elif pr.get("updated_at", "") < since:
-                    # Past our analysis window — stop early.
                     return pulls
-
-            page += 1
 
     return pulls
 
@@ -114,42 +111,29 @@ async def fetch_deployments(
     """
     since = _since_iso(days)
 
-    async with httpx.AsyncClient(
-        base_url=GITHUB_API,
-        headers=_github_headers(token),
-        timeout=25.0,
-    ) as client:
+    async with HTTPConnector(_github_config(token)) as http:
         # --- Try Deployments API ---
-        deploys = await _fetch_deployments_api(client, owner, repo, since)
+        deploys = await _fetch_deployments_api(http, owner, repo, since)
         if deploys:
             return deploys
 
         # --- Fallback: Releases API ---
-        return await _fetch_releases_api(client, owner, repo, since)
+        return await _fetch_releases_api(http, owner, repo, since)
 
 
 async def _fetch_deployments_api(
-    client: httpx.AsyncClient,
+    http: HTTPConnector,
     owner: str,
     repo: str,
     since: str,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
-    page = 1
-    while True:
-        resp = await client.get(
-            f"/repos/{owner}/{repo}/deployments",
-            params={
-                "environment": "production",
-                "per_page": 100,
-                "page": page,
-            },
-        )
-        resp.raise_for_status()
-        batch: list[dict[str, Any]] = resp.json()
-        if not batch:
-            break
-
+    async for batch in http.paginate(
+        "GET",
+        path=f"/repos/{owner}/{repo}/deployments",
+        strategy="link_header",
+        params={"environment": "production"},
+    ):
         for deploy in batch:
             if deploy.get("created_at", "") >= since:
                 deploy["_source"] = "deployment_api"
@@ -157,29 +141,21 @@ async def _fetch_deployments_api(
             else:
                 return results
 
-        page += 1
-
     return results
 
 
 async def _fetch_releases_api(
-    client: httpx.AsyncClient,
+    http: HTTPConnector,
     owner: str,
     repo: str,
     since: str,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
-    page = 1
-    while True:
-        resp = await client.get(
-            f"/repos/{owner}/{repo}/releases",
-            params={"per_page": 100, "page": page},
-        )
-        resp.raise_for_status()
-        batch: list[dict[str, Any]] = resp.json()
-        if not batch:
-            break
-
+    async for batch in http.paginate(
+        "GET",
+        path=f"/repos/{owner}/{repo}/releases",
+        strategy="link_header",
+    ):
         for release in batch:
             published = release.get("published_at") or release.get("created_at", "")
             if published >= since:
@@ -187,8 +163,6 @@ async def _fetch_releases_api(
                 results.append(release)
             else:
                 return results
-
-        page += 1
 
     return results
 
@@ -213,37 +187,24 @@ async def fetch_issues(
     seen: set[int] = set()
     issues: list[dict[str, Any]] = []
 
-    async with httpx.AsyncClient(
-        base_url=GITHUB_API,
-        headers=_github_headers(token),
-        timeout=25.0,
-    ) as client:
+    async with HTTPConnector(_github_config(token)) as http:
         for label in sorted(_DEFAULT_INCIDENT_LABELS):
-            page = 1
-            while True:
-                resp = await client.get(
-                    f"/repos/{owner}/{repo}/issues",
-                    params={
-                        "labels": label,
-                        "state": "all",
-                        "since": since,
-                        "sort": "created",
-                        "direction": "desc",
-                        "per_page": 100,
-                        "page": page,
-                    },
-                )
-                resp.raise_for_status()
-                batch: list[dict[str, Any]] = resp.json()
-                if not batch:
-                    break
-
+            async for batch in http.paginate(
+                "GET",
+                path=f"/repos/{owner}/{repo}/issues",
+                strategy="link_header",
+                params={
+                    "labels": label,
+                    "state": "all",
+                    "since": since,
+                    "sort": "created",
+                    "direction": "desc",
+                },
+            ):
                 for issue in batch:
                     num = issue["number"]
                     if num not in seen and not issue.get("pull_request"):
                         seen.add(num)
                         issues.append(issue)
-
-                page += 1
 
     return issues

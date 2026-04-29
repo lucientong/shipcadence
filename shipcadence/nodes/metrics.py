@@ -154,9 +154,13 @@ def rate_mttr(median_hours: float) -> str:
 # ---------------------------------------------------------------------------
 
 
-@node(name="compute_metrics")
+@node(name="compute_metrics", executor="process")
 def compute_metrics(data: NormalizedData) -> DORAMetrics:
     """Compute all four DORA metrics from normalised data.
+
+    Uses ``executor="process"`` to offload CPU-bound statistical
+    computation (percentiles, correlations) to a separate process
+    via ``ProcessPoolExecutor`` when run under ``AsyncExecutor``.
 
     Receives ``NormalizedData`` as a single positional argument (one
     predecessor: ``transform_all``).
